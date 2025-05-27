@@ -50,54 +50,71 @@ class ProductsInfoController: NSObject {
     
     // As we can have multiple inflight requests, we store them in a dictionary by product ids
     private var inflightRequestsStorage: [Set<String>: InAppProductQuery] = [:]
-    private let requestsQueue = DispatchQueue(label: "inflightRequestsQueue", attributes: .concurrent)
-    private var inflightRequests: [Set<String>: InAppProductQuery] {
-        get {
-            requestsQueue.sync {
-                inflightRequestsStorage
-            }
-        }
-        set {
-            requestsQueue.sync(flags: .barrier) {
-                inflightRequestsStorage = newValue
-            }
-        }
-    }
+    private let requestsQueue = DispatchQueue(label: "inflightRequestsQueue")
+    private var inflightRequests: [Set<String>: InAppProductQuery] = [:]
 
     @discardableResult
     func retrieveProductsInfo(_ productIds: Set<String>, completion: @escaping (RetrieveResults) -> Void) -> InAppProductRequest {
 
-        if inflightRequests[productIds] == nil {
-            let request = inAppProductRequestBuilder.request(productIds: productIds) { results in
+        var requestToReturn: InAppProductRequest!
+        var handlersToCallIfCompleted: [InAppProductRequestCallback]?
+        var resultsIfCompleted: RetrieveResults?
+
+        // Use queue.sync to ensure all access to inflightRequests is serialized
+        requestsQueue.sync {
+            // Check if a request already exists
+            if var query = self.inflightRequests[productIds] {
+                // --- Request Exists ---
                 
-                if let query = self.inflightRequests[productIds] {
-                    for completion in query.completionHandlers {
-                        completion(results)
+                // Append the new completion handler
+                query.completionHandlers.append(completion)
+                self.inflightRequests[productIds] = query // Update the dictionary
+                requestToReturn = query.request
+
+                // If the existing request is already completed, capture its results
+                // and handlers to call them *outside* this sync block.
+                if query.request.hasCompleted, let results = query.request.cachedResults {
+                    handlersToCallIfCompleted = query.completionHandlers
+                    resultsIfCompleted = results
+                }
+                
+            } else {
+                // --- Request Does NOT Exist ---
+
+                // Create the actual SKProductsRequest via the builder
+                let request = self.inAppProductRequestBuilder.request(productIds: productIds) { results in
+                    
+                    var handlersToCall: [InAppProductRequestCallback]?
+                    
+                    // Synchronize access within the callback
+                    self.requestsQueue.sync {
+                        // Retrieve the handlers and remove the request from inflight
+                        handlersToCall = self.inflightRequests[productIds]?.completionHandlers
+                        self.inflightRequests[productIds] = nil
                     }
-                    self.inflightRequests[productIds] = nil
-                } else {
-                    // should not get here, but if it does it seems reasonable to call the outer completion block
-                    completion(results)
+                    
+                    // Call all completion handlers asynchronously on the main thread
+                    DispatchQueue.main.async {
+                        handlersToCall?.forEach { $0(results) }
+                    }
                 }
+                
+                // Store the new query in the dictionary (This was the crash site, now safe)
+                self.inflightRequests[productIds] = InAppProductQuery(request: request, completionHandlers: [completion])
+                request.start() // Start the StoreKit request
+                requestToReturn = request
             }
-            inflightRequests[productIds] = InAppProductQuery(request: request, completionHandlers: [completion])
-            request.start()
-
-            return request
-
-        } else {
-            
-            inflightRequests[productIds]!.completionHandlers.append(completion)
-
-            let query = inflightRequests[productIds]!
-
-            if query.request.hasCompleted {
-                query.completionHandlers.forEach {
-                    $0(query.request.cachedResults!)
-                }
-            }
-
-            return inflightRequests[productIds]!.request
         }
+
+        // If we found an already-completed request earlier, call its handlers now.
+        // This runs outside the sync block and asynchronously.
+        if let handlers = handlersToCallIfCompleted, let results = resultsIfCompleted {
+            DispatchQueue.main.async {
+                handlers.forEach { $0(results) }
+            }
+        }
+
+        // Return the request (either existing or new)
+        return requestToReturn
     }
 }
